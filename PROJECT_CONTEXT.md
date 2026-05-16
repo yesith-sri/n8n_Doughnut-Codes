@@ -36,28 +36,25 @@ The current n8n flow does the following:
 
 1. Accepts a Docker image URL via POST webhook.
 2. Fetches registry metadata and extracts runtime, ports, memory, and CPU.
-3. Recommends an architecture (AWS Fargate, GCP Cloud Run, or Azure Container Apps).
+3. Recommends an architecture. The current POC provisions AWS ECS Fargate from public Docker Hub images.
 4. Stores the deployment in Postgres and responds to the frontend with a resume URL.
 5. Pauses for multi-turn chat with a human operator via a webhook Wait node.
-6. On approval: the Deploy Agent generates a provider-specific config and calls the provider REST API autonomously.
-7. Extracts the real service URL from the API response (App Runner ServiceUrl / Cloud Run uri / Container Apps fqdn).
+6. On approval: the Deploy Agent generates an ECS config and calls the Forge AWS provisioner.
+7. Extracts the real task public URL from the ECS task network interface.
 8. Runs a health check against the live endpoint; on failure the Debugger Agent diagnoses the root cause.
 9. Marks deployment as deployed or failed in Postgres.
 10. Runs a scheduled monitor every 5 minutes against all healthy deployments.
 
 ## Workflow architecture (current)
 
-Providers supported: `aws`, `gcp`, `azure`. Railway and Fly.io have been removed.
+Providers shown in the UI: `aws`, `gcp`, `azure`. The active POC provisions only `aws` on ECS Fargate.
 
 The deploy pipeline is fully autonomous after a human commits:
-1. `Deploy Agent` (GPT-4.1) generates a JSON config with `projectName`, `image`, `port`, `memoryMB`, `cpuLimit`, `healthCheckPath`, `region`, `envVars`, `gcpProject`.
+1. `Deploy Agent` (GPT-4.1) generates a JSON config with `projectName`, `image`, `port`, `memoryMB`, `cpuLimit`, `healthCheckPath`, `region`, `envVars`.
 2. `Parse Deploy Config` (Code node) safely parses the JSON string into an object.
-3. `Route by Provider` (Switch) routes to the correct provider branch.
-4. Each branch calls the provider REST API, then extracts the real service URL from the response:
-   - AWS: `POST https://apprunner.{region}.amazonaws.com/20200525/service` → `Service.ServiceUrl`
-   - GCP: `POST Cloud Run v2` → wait 45s → `GET` the service → `uri`
-   - Azure: `PUT Container Apps` → `properties.configuration.ingress.fqdn`
-5. `Collect Health Result` (Code node) stitches the deploymentId + URL from whichever branch ran.
+3. `Provision AWS ECS` calls the Forge server `/api/aws/provision` route.
+4. `Describe AWS ECS` resolves the running Fargate task public IP and returns `http://<public-ip>:<port>`.
+5. `Collect Health Result` (Code node) stitches the deploymentId + URL.
 6. `Health Check` → `Check Health Status` → `Update Status Success` or `Debugger Agent` → `Update Status Failed`.
 
 ## Integration Contract

@@ -18,7 +18,8 @@ export async function POST(request: Request) {
   const { url, error } = getDeployWebhookUrl();
   if (!url) return jsonError(500, error ?? "Missing webhook URL");
 
-  const body = await request.text();
+  const rawBody = await request.text();
+  const body = withServerContext(rawBody);
 
   let upstream: Response;
   try {
@@ -33,4 +34,19 @@ export async function POST(request: Request) {
   }
 
   return passthrough(upstream);
+}
+
+function withServerContext(rawBody: string) {
+  const baseUrl = process.env.WEBSITE_URL ?? process.env.FORGE_APP_BASE_URL;
+  if (!baseUrl) return rawBody;
+
+  try {
+    const payload = JSON.parse(rawBody) as Record<string, unknown>;
+    return JSON.stringify({
+      ...payload,
+      forgeProvisionerUrl: new URL("/api/aws/provision", baseUrl).toString(),
+    });
+  } catch {
+    return rawBody;
+  }
 }

@@ -1,25 +1,24 @@
 # n8n Workflow Map · `agentic-idp`
 
-The single source of truth lives in n8n (workflow id `Co7HN1Zf7FQT6YSa`). This document describes the shape that backs the Forge frontend so future agents can reason about it without round-tripping to the n8n UI.
+The single source of truth lives in n8n (workflow id `Co7HN1Zf7FQT6YSa`). This document describes the current AWS Docker Hub + ECS Fargate POC shape that backs the Forge frontend.
 
 ## High-level flow
 
 1. The frontend POSTs a Docker image URL to the `Deployment Webhook`.
 2. The Docker Hub registry is hit for image metadata.
 3. The Analyzer Agent extracts runtime, ports, memory, and CPU.
-4. The Architect Agent recommends one of `AWS Fargate`, `GCP Cloud Run`, or `Azure Container Apps`.
+4. The Architect Agent recommends `AWS ECS Fargate` for the AWS Docker Hub POC.
 5. Costs for all three providers are estimated and the deployment row is saved to Postgres.
 6. The `Respond to Frontend` node returns the deployment summary + the first resume URL to the browser.
 7. The workflow pauses on the `Chat Wait` webhook.
 8. The frontend chats with the **Deployment Chat Agent** by POSTing `{ type: "chat", message, history }` to the current resume URL. Each reply contains a new `resumeUrl`. The loop continues until the user commits.
 9. The frontend commits with `{ type: "final", action, provider, plan }`. The workflow exits the chat loop.
-10. On `approve`: the Deploy Agent generates a provider-specific JSON config. `Parse Deploy Config` safely parses the JSON string (guarding against LLM preamble). The Switch routes to AWS / GCP / Azure. Each branch:
-    - calls the provider REST API autonomously,
-    - extracts the real service URL from the API response,
-    - feeds it through `Collect Health Result` to stitch the deploymentId + URL for the shared health check.
-11. `Health Check` GETs the live endpoint; success → `Update Status Success` (saves `deployment_url`); failure → Debugger Agent → `Update Status Failed`.
-12. On `reject`: `Update Status Rejected` flips the row to `rejected`.
-13. A separate Monitoring Schedule trigger runs every 5 minutes, marking previously-healthy deployments as `unhealthy` if their endpoint stops responding.
+10. On `approve`: `Check AWS Provider` allows only `provider="aws"` for this POC. Non-AWS final selections are marked failed with an explicit unsupported-provider error.
+11. The Deploy Agent generates an AWS ECS config for the public Docker Hub image. `Parse Deploy Config` safely parses the JSON string (guarding against LLM preamble).
+12. The AWS branch calls the Forge provisioner endpoint, waits, describes the ECS service/task, then health-checks the task public URL.
+13. `Health Check` GETs the live endpoint; success → `Update Status Success` (saves `deployment_url`); failure → Debugger Agent → `Update Status Failed`.
+14. On `reject`: `Update Status Rejected` flips the row to `rejected`.
+15. A separate Monitoring Schedule trigger runs every 5 minutes, marking previously-healthy deployments as `unhealthy` if their endpoint stops responding.
 
 ## Triggers
 
@@ -37,7 +36,7 @@ The original Manual Trigger has been removed.
 3. `Fetch Docker Image Metadata` — `GET https://hub.docker.com/v2/repositories/{repo}/` (best-effort; `neverError: true`).
 4. `Compose App Spec` — builds a single `specText` string for the analyzer from the registry metadata + any provided Dockerfile.
 5. `Analyzer Agent` — Information Extractor with `gpt-4.1`, returns `{ runtime, ports, estimatedMemoryMB, estimatedCPU }`.
-6. `Architect Agent` — AI Agent with `gpt-4.1`, returns exactly one of `AWS Fargate | GCP Cloud Run | Azure Container Apps`.
+6. `Architect Agent` — AI Agent with `gpt-4.1`, returns `AWS ECS Fargate` for this Docker Hub POC.
 7. `Cost Estimator` — derives `awsCost`, `gcpCost`, `azureCost`, and a `recommendedProvider` from the architect's label.
 8. `Save Deployment Request` — `INSERT ... RETURNING id` against the `deployments` table.
 9. `Respond to Frontend` — JSON response (see `frontend-contract.md`). Includes the **first** resume URL pointing at `Chat Wait`.
@@ -60,21 +59,19 @@ The original Manual Trigger has been removed.
 
 ### Approved branch (`Check Final Approval` ▸ `onTrue`)
 
-20. `Capture Approval` — pulls deployment metadata + provider from previous nodes; persists the user's `plan` note from `Extract Final Decision`.
-21. `Update Status Approved` — sets `status='deploying'`, `provider=<choice>`.
-22. `Deploy Agent` — AI Agent (GPT-4.1) that generates a JSON string: `{ projectName, image, port, memoryMB, cpuLimit, healthCheckPath, region, envVars, gcpProject }`.
-23. `Parse Deploy Config` — Code node. Safely parses the JSON string from `Deploy Agent`. Falls back to regex-extraction if the LLM prepends text. Merges with `Capture Approval` data.
-24. `Route by Provider` — Switch on `provider`, cases `aws | gcp | azure`.
-25. `Prepare {AWS|GCP|Azure} Deployment` — Set nodes that accept the parsed `deployConfig` object, pull `region` / `gcpProject` to the top level.
-26. `Deploy to {AWS|GCP|Azure}` — HTTP Request to the provider's REST API:
-    - AWS: `POST https://apprunner.{region}.amazonaws.com/20200525/service` (correct regional endpoint). Response: `{ Service: { ServiceUrl } }`.
-    - GCP: `POST https://run.googleapis.com/v2/projects/{gcpProject}/locations/{region}/services`. Async — returns an Operation.
-    - Azure: `PUT https://management.azure.com/subscriptions/SUB_ID/resourceGroups/RG_NAME/providers/Microsoft.App/containerApps/{name}?api-version=2024-03-01`. Response: `{ properties.configuration.ingress.fqdn }`.
-27. **GCP only**: `Wait for GCP Ready` (45 s time-interval) → `Get GCP Service URL` (GET the service resource) → `Extract GCP URL`.
-28. `Extract {AWS|GCP|Azure} URL` — Set nodes that pull the real service URL from the provider response and carry `deploymentId` + `healthCheckPath` forward.
-29. `Health Check` — `GET {deploymentUrl}{healthCheckPath}` with `neverError: true`. All three provider branches fan in here.
-30. `Collect Health Result` — Code node. Uses try-catch to read from whichever `Extract * URL` node ran, stitching `deploymentUrl`, `deploymentId`, and `provider` for the IF below.
-31. `Check Health Status` — IF on `statusCode === 200`.
+20. `Check AWS Provider` — routes `aws` to provisioning; any other provider to `Update Status Unsupported Provider`.
+21. `Capture Approval` — pulls deployment metadata + provisioner URL from previous nodes; persists the user's `plan` note from `Extract Final Decision`.
+22. `Update Status Approved` — sets `status='deploying'`, `provider='aws'`.
+23. `Deploy Agent` — AI Agent (GPT-4.1) that generates a JSON string: `{ projectName, image, port, memoryMB, cpuLimit, healthCheckPath, region, envVars }`.
+24. `Parse Deploy Config` — Code node. Safely parses the JSON string from `Deploy Agent`. Falls back to regex-extraction if the LLM prepends text. Merges with `Capture Approval` data.
+25. `Prepare AWS Deployment` — Set node that accepts the parsed `deployConfig`, pulls `region`, and carries `provisionerUrl`.
+26. `Provision AWS ECS` — HTTP Request to `${forgeProvisionerUrl}` with `{ action: "create", ...deployConfig }`. The Forge server signs ECS/EC2 calls with `ACCESS_KEY` / `SECRET_KEY` and returns `{ clusterName, serviceName, status }`.
+27. `Wait for ECS Ready` — 90-second time-interval wait for Fargate task startup.
+28. `Describe AWS ECS` — calls `${forgeProvisionerUrl}` with `{ action: "status", clusterName, serviceName, port }` to resolve the task public URL and status.
+29. `Extract AWS URL` — pulls the real service URL and carries `deploymentId` + `healthCheckPath` forward.
+30. `Health Check` — `GET {deploymentUrl}{healthCheckPath}` with `neverError: true`.
+31. `Collect Health Result` — stitches `deploymentUrl`, `deploymentId`, and `provider` for the IF below.
+32. `Check Health Status` — IF on `statusCode === 200`.
 
 ### Health outcomes
 
@@ -128,9 +125,7 @@ CREATE TABLE deployments (
 | --- | --- | --- |
 | `Postgres account` | All Postgres nodes | Auto-assigned by the MCP. |
 | `OpenAI account` | `OpenAI GPT-4.1` model node | Shared by Analyzer / Architect / Deploy / Debugger. |
-| `AWS API Auth` (HTTP header) | `Deploy to AWS` | Configure with an `Authorization: AWS4-HMAC-SHA256 ...` header or signed proxy. |
-| `GCP OAuth2` | `Deploy to GCP` | Cloud Run admin scope. |
-| `Azure OAuth2` | `Deploy to Azure` | Azure Resource Manager scope; replace `SUB_ID` and `RG_NAME` placeholders in the URL. |
+| Forge AWS provisioner | `Provision AWS ECS`, `Describe AWS ECS` | n8n calls `${WEBSITE_URL}/api/aws/provision`; the Forge server signs ECS/EC2 calls with `ACCESS_KEY` / `SECRET_KEY`. |
 
 ## What was removed / replaced across all revisions
 
@@ -141,7 +136,8 @@ CREATE TABLE deployments (
 - The Railway provider branch (replaced by GCP Cloud Run — Railway is gone for good).
 - The single-shot `Wait for Human Approval` + `Check Approval` pair (replaced with the chat loop).
 - The broken `Prepare * Deployment` nodes that treated `$json.output` (a string) as an object — replaced by `Parse Deploy Config` code node that safely parses the JSON.
-- The wrong AWS endpoint `api.amazonaws.com/v1/apprunner/services` — replaced with the correct regional endpoint `apprunner.{region}.amazonaws.com/20200525/service`.
+- The direct AWS HTTP call from n8n — replaced with the Forge `/api/aws/provision` callback because AWS APIs require SigV4 signing and the POC credentials live in the server `.env`.
+- GCP and Azure deploy branches in the active n8n workflow — temporarily replaced by `Update Status Unsupported Provider` for the AWS Docker Hub ECS POC. The frontend labels remain `aws`, `gcp`, `azure`, but only `aws` provisions in this revision.
 - The data loss at `Health Check` where `deploymentUrl` and `deploymentId` disappeared after the provider HTTP calls — fixed by `Extract {Provider} URL` Set nodes + `Collect Health Result` Code node.
 - The `Update Status Success` bug where `deployment_url` was set to `architecture` instead of the actual service URL.
 

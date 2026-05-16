@@ -98,7 +98,7 @@ The loop keeps cycling until the frontend POSTs a final message. Each iteration:
 When the body is `{ type: "final", action, provider, plan? }`, the `Is Final Decision?` IF routes to the **true** branch:
 `Chat Wait → Is Final Decision? (true) → Extract Final Decision → Respond Final Decision → Check Final Approval`
 
-- On `approve`: `Capture Approval → Update Status Approved → Deploy Agent → Route by Provider → Prepare {AWS|GCP|Azure} Deployment → Deploy to {AWS|GCP|Azure} → Health Check → Check Health Status → (Update Status Success | Debugger Agent → Update Status Failed)`
+- On `approve`: current POC routes `aws` to `Capture Approval → Update Status Approved → Deploy Agent → Prepare AWS Deployment → Provision AWS ECS → Wait for ECS Ready → Describe AWS ECS → Health Check → Check Health Status → (Update Status Success | Debugger Agent → Update Status Failed)`. Non-AWS final selections are marked unsupported for this POC.
 - On `reject`: `Update Status Rejected`.
 
 ### Response shapes
@@ -148,7 +148,7 @@ When the body is `{ type: "final", action, provider, plan? }`, the `Is Final Dec
 - n8n credentials (set in the n8n Credentials manager):
   - `Postgres account` → `Save Deployment Request`, `Update Status *`, `Fetch Active Deployments`, `Mark Deployment Unhealthy`
   - `OpenAI account` → the shared `OpenAI GPT-4.1` sub-model (used by every AI Agent)
-  - `AWS API Auth` (Header Auth) → `Deploy to AWS` — note that real AWS APIs need SigV4; the demo path is to front App Runner with an API Gateway that accepts a static key
+  - AWS provisioning uses the Forge server `/api/aws/provision` route, not an n8n AWS credential. Forge signs ECS/EC2 calls with `ACCESS_KEY` / `SECRET_KEY` from `.env.local`.
   - `GCP OAuth2` → `Deploy to GCP` (also replace `PROJECT_ID` placeholder in the node URL)
   - `Azure OAuth2` → `Deploy to Azure` (also replace `SUB_ID` / `RG_NAME` placeholders in the node URL)
   - Docker Hub fetch is unauthenticated.
