@@ -367,10 +367,6 @@ async function createService(payload: ProvisionPayload) {
             assignPublicIp: "ENABLED",
           },
         },
-        tags: [
-          { key: "ManagedBy", value: "Forge" },
-          { key: "DeploymentId", value: String(payload.deploymentId || "") },
-        ],
       }),
     );
 
