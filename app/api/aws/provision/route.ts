@@ -16,6 +16,7 @@ import {
   ListTasksCommand,
   RegisterTaskDefinitionCommand,
 } from "@aws-sdk/client-ecs";
+import { CreateServiceLinkedRoleCommand, IAMClient } from "@aws-sdk/client-iam";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -103,6 +104,7 @@ function makeClients(aws: AwsConfig) {
   return {
     ecs: new ECSClient({ region: aws.region, credentials: aws.credentials }),
     ec2: new EC2Client({ region: aws.region, credentials: aws.credentials }),
+    iam: new IAMClient({ region: aws.region, credentials: aws.credentials }),
   };
 }
 
@@ -305,6 +307,21 @@ async function getTaskPublicUrl(
   };
 }
 
+async function ensureEcsServiceLinkedRole(iam: IAMClient) {
+  try {
+    await iam.send(
+      new CreateServiceLinkedRoleCommand({
+        AWSServiceName: "ecs.amazonaws.com",
+        Description: "Allows Amazon ECS to manage resources for Forge ECS POC services.",
+      }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("InvalidInput") || message.includes("already exists")) return;
+    throw err;
+  }
+}
+
 async function createService(payload: ProvisionPayload) {
   const image = payload.image?.trim();
   if (!image) {
@@ -322,7 +339,7 @@ async function createService(payload: ProvisionPayload) {
     return json(500, { ok: false, error: aws.error, region: aws.region });
   }
 
-  const { ecs, ec2 } = makeClients(aws);
+  const { ecs, ec2, iam } = makeClients(aws);
   const clusterName = process.env.AWS_ECS_CLUSTER_NAME || "forge-poc";
   const serviceName = serviceNameFor(payload.projectName, payload.deploymentId);
   const port = Number(payload.port || 80);
@@ -331,6 +348,7 @@ async function createService(payload: ProvisionPayload) {
 
   try {
     await ecs.send(new CreateClusterCommand({ clusterName }));
+    await ensureEcsServiceLinkedRole(iam);
     const networking = await getNetworking(ec2, serviceName, port);
 
     const taskDefinition = await ecs.send(

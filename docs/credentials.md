@@ -111,7 +111,8 @@ Minimal IAM policy shape for the `ACCESS_KEY` principal:
         "ec2:DescribeSecurityGroups",
         "ec2:CreateSecurityGroup",
         "ec2:AuthorizeSecurityGroupIngress",
-        "ec2:DescribeNetworkInterfaces"
+        "ec2:DescribeNetworkInterfaces",
+        "iam:CreateServiceLinkedRole"
       ],
       "Resource": "*"
     }
