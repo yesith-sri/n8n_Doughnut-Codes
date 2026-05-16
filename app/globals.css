@@ -1,26 +1,234 @@
 @import "tailwindcss";
 
+/* =====================================================================
+   FORGE DESIGN TOKENS
+   Trustworthy, editorial dark surface inspired by Stripe / Linear / Mercury.
+   - Backgrounds are warm-charcoal (not stark black) so the eye relaxes
+   - One brand accent (warm amber gold) — earned, not neon
+   - One supporting accent (deep teal) for secondary actions / focus
+   - Status colors are muted and "natural" so the UI feels honest
+   - Type: Oxanium for display + numerals (engineered look), Roboto for prose
+   ===================================================================== */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Surfaces */
+  --bg-base: #0c1014;            /* canvas */
+  --bg-elevated: #11161d;        /* panels */
+  --bg-raised: #161c25;          /* cards inside panels */
+  --bg-input: #0a0e13;           /* inputs / code */
+
+  /* Lines */
+  --line-soft: rgba(231, 220, 199, 0.06);
+  --line-medium: rgba(231, 220, 199, 0.12);
+  --line-strong: rgba(231, 220, 199, 0.22);
+
+  /* Text */
+  --ink-primary: #ede5d3;        /* warm off-white, easier on the eye than #fff */
+  --ink-secondary: #a8a89b;      /* warm stone */
+  --ink-tertiary: #6e7177;       /* metadata, captions */
+  --ink-disabled: #4a4d55;
+
+  /* Brand */
+  --brand: #d4a24b;              /* warm amber gold — primary trust color */
+  --brand-soft: rgba(212, 162, 75, 0.14);
+  --brand-strong: #e9b964;
+
+  /* Supporting */
+  --accent: #4d8a89;             /* deep teal — secondary / focus */
+  --accent-soft: rgba(77, 138, 137, 0.16);
+  --accent-strong: #6aaba9;
+
+  /* Status (muted, "natural") */
+  --status-pending: #c7a456;
+  --status-pending-soft: rgba(199, 164, 86, 0.14);
+  --status-active: #6aaba9;
+  --status-active-soft: rgba(106, 171, 169, 0.15);
+  --status-ok: #7ea676;
+  --status-ok-soft: rgba(126, 166, 118, 0.14);
+  --status-warn: #c9925a;
+  --status-warn-soft: rgba(201, 146, 90, 0.14);
+  --status-error: #c4655a;
+  --status-error-soft: rgba(196, 101, 90, 0.14);
+
+  /* Fonts (set as variables in layout.tsx) */
+  --font-display: var(--font-display, "Oxanium"), ui-sans-serif, system-ui, sans-serif;
+  --font-body: var(--font-body, "Roboto"), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "Menlo", monospace;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-background: var(--bg-base);
+  --color-foreground: var(--ink-primary);
+  --color-brand: var(--brand);
+  --color-accent: var(--accent);
+
+  --font-sans: var(--font-body);
+  --font-body: var(--font-body);
+  --font-display: var(--font-display);
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* =====================================================================
+   GLOBALS
+   ===================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+  background: var(--bg-base);
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  min-height: 100%;
+  margin: 0;
+  color: var(--ink-primary);
+  font-family: var(--font-body);
+  font-feature-settings: "ss01", "ss02", "cv11";
+  letter-spacing: 0.005em;
+
+  /* Subtle radial wash. Three faint gradients = "lit room" feel, not gradient soup. */
+  background:
+    radial-gradient(1100px 580px at 12% -8%, rgba(212, 162, 75, 0.07), transparent 62%),
+    radial-gradient(900px 540px at 92% 4%, rgba(77, 138, 137, 0.06), transparent 60%),
+    radial-gradient(900px 600px at 50% 110%, rgba(126, 166, 118, 0.04), transparent 60%),
+    linear-gradient(180deg, #0d1117 0%, #0b0f15 60%, #090c11 100%);
+  background-attachment: fixed;
+}
+
+::selection {
+  background: rgba(212, 162, 75, 0.32);
+  color: #fff;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(231, 220, 199, 0.1);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(231, 220, 199, 0.18);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* =====================================================================
+   UTILITY CLASSES
+   ===================================================================== */
+
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.012em;
+}
+
+.font-body {
+  font-family: var(--font-body);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.numerals {
+  font-family: var(--font-display);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.eyebrow {
+  font-family: var(--font-display);
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.28em;
+  color: var(--ink-tertiary);
+}
+
+.panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--line-soft);
+  border-radius: 22px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.025) inset,
+    0 30px 80px -40px rgba(0, 0, 0, 0.7);
+}
+
+.panel-raised {
+  background: var(--bg-raised);
+  border: 1px solid var(--line-soft);
+  border-radius: 16px;
+}
+
+.btn-primary {
+  background: var(--brand);
+  color: #15110a;
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 10px;
+  padding: 0.7rem 1.1rem;
+  transition: filter 180ms ease, transform 180ms ease;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.08);
+}
+
+.btn-primary:active {
+  transform: translateY(1px);
+}
+
+.btn-primary:disabled {
+  filter: grayscale(0.4) brightness(0.7);
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--ink-primary);
+  font-family: var(--font-display);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--line-medium);
+  border-radius: 10px;
+  padding: 0.6rem 1rem;
+  transition: background 180ms ease, border-color 180ms ease;
+}
+
+.btn-ghost:hover {
+  background: rgba(231, 220, 199, 0.04);
+  border-color: var(--line-strong);
+}
+
+/* Reveal helper for GSAP-driven entrance animations.
+   Without JS, content still renders (no opacity:0 trap). */
+.reveal {
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
 }
