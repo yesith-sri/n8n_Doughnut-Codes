@@ -73,6 +73,33 @@ type ChatMessage = {
   ts: string;
 };
 
+// ---------- Security scan types -------------------------------------------
+
+type ScanSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+type ScanStatus = "idle" | "scanning" | "done" | "error";
+
+type VulnItem = {
+  id: string;
+  pkg: string;
+  target: string;
+  installedVersion: string;
+  fixedVersion: string;
+  severity: ScanSeverity;
+  title: string;
+};
+
+type ScanResult = {
+  image: string;
+  scannedAt: string;
+  summary: Record<ScanSeverity, number>;
+  vulnerabilities: VulnItem[];
+  suggestions: string[];
+  rollbackStrategy: string;
+  riskLevel: "safe" | "warn" | "critical";
+};
+
+// --------------------------------------------------------------------------
+
 const SAMPLE_IMAGE = "nginx:latest";
 const SAMPLE_DOCKERFILE = `FROM node:20-alpine
 WORKDIR /app
@@ -273,6 +300,11 @@ export default function Home() {
   // currentResumeUrl rotates with every chat turn — each Wait resumption
   // hands us back a fresh URL we have to use for the next message.
   const [currentResumeUrl, setCurrentResumeUrl] = useState<string | null>(null);
+
+  // -- security scan state --
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
+  const [scanError, setScanError] = useState<string | null>(null);
 
   // -- refs --
   const rootRef = useRef<HTMLDivElement>(null);
@@ -642,6 +674,75 @@ export default function Home() {
     setIsChatting(false);
   }
 
+  // ------------------------------------------------------------------
+  // SCAN — runs Trivy against the image via the /api/scan server proxy.
+  // Completely independent of the n8n workflow.
+  // ------------------------------------------------------------------
+  async function scanImage() {
+    const image = dockerImage.trim();
+    if (!image || scanStatus === "scanning") return;
+
+    setScanStatus("scanning");
+    setScanResult(null);
+    setScanError(null);
+    pushLog(makeLog("Security", "info", `Starting vulnerability scan for ${image}…`));
+
+    let res: Response;
+    try {
+      res = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dockerImageUrl: image }),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setScanStatus("error");
+      setScanError(`Network error reaching /api/scan: ${msg}`);
+      pushLog(makeLog("Security", "error", `Scan network error: ${msg}`));
+      return;
+    }
+
+    const raw = await res.text();
+    if (!res.ok) {
+      let errMsg: string;
+      try {
+        const parsed = JSON.parse(raw) as { error?: string };
+        errMsg = parsed.error ?? raw.slice(0, 240);
+      } catch {
+        errMsg = raw.slice(0, 240);
+      }
+      setScanStatus("error");
+      setScanError(errMsg);
+      pushLog(makeLog("Security", "error", `Scan failed (${res.status}): ${errMsg}`));
+      return;
+    }
+
+    let data: ScanResult;
+    try {
+      data = JSON.parse(raw) as ScanResult;
+    } catch {
+      const msg = `Scan API returned non-JSON. First 200 chars: ${raw.slice(0, 200)}`;
+      setScanStatus("error");
+      setScanError(msg);
+      pushLog(makeLog("Security", "error", msg));
+      return;
+    }
+
+    setScanResult(data);
+    setScanStatus("done");
+
+    const { summary, riskLevel } = data;
+    const logLevel: LogLevel =
+      riskLevel === "critical" ? "error" : riskLevel === "warn" ? "warning" : "success";
+    pushLog(
+      makeLog(
+        "Security",
+        logLevel,
+        `Scan complete — ${summary.CRITICAL} critical, ${summary.HIGH} high, ${summary.MEDIUM} medium, ${summary.LOW} low CVEs found.`,
+      ),
+    );
+  }
+
   function handleFile(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -790,6 +891,25 @@ export default function Home() {
                     />
                     <button
                       type="button"
+                      onClick={scanImage}
+                      disabled={scanStatus === "scanning" || !dockerImage.trim()}
+                      className="btn-ghost shrink-0"
+                      title="Scan image for CVEs using Trivy"
+                    >
+                      {scanStatus === "scanning" ? (
+                        <span className="flex items-center gap-2">
+                          <ScanSpinner />
+                          Scanning…
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-2">
+                          <ShieldIcon riskLevel={scanResult?.riskLevel ?? null} />
+                          Scan security
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
                       onClick={submitDeploy}
                       disabled={isSubmitting || !dockerImage.trim()}
                       className="btn-primary"
@@ -797,6 +917,11 @@ export default function Home() {
                       {isSubmitting ? "Forging..." : "Forge deployment"}
                     </button>
                   </div>
+                  {scanResult?.riskLevel === "critical" ? (
+                    <p className="rounded-lg border border-[color:var(--status-error)]/30 bg-[color:var(--status-error-soft)] px-3 py-2 text-[12px] text-[var(--ink-primary)]">
+                      ⚠ Critical vulnerabilities detected in this image. Review the Security panel before deploying.
+                    </p>
+                  ) : null}
                   {error ? (
                     <p className="rounded-lg border border-[color:var(--status-error)]/30 bg-[color:var(--status-error-soft)] px-3 py-2 text-[12px] text-[var(--ink-primary)]">
                       {error}
@@ -867,6 +992,15 @@ export default function Home() {
                 ) : null}
               </div>
             </Panel>
+
+            {/* SECURITY SCAN */}
+            {(scanStatus !== "idle") ? (
+              <SecurityPanel
+                status={scanStatus}
+                result={scanResult}
+                error={scanError}
+              />
+            ) : null}
 
             {/* DEPLOYMENT SNAPSHOT */}
             <Panel eyebrow="Snapshot" title="Deployment record">
@@ -1413,5 +1547,357 @@ function TimelineRow({
         </p>
       </div>
     </div>
+  );
+}
+
+/* =====================================================================
+   SECURITY SCAN COMPONENTS
+   ===================================================================== */
+
+const SEVERITY_META: Record<
+  ScanSeverity,
+  { label: string; bg: string; text: string; border: string }
+> = {
+  CRITICAL: {
+    label: "Critical",
+    bg: "bg-[color:var(--status-error-soft)]",
+    text: "text-[var(--status-error)]",
+    border: "border-[color:var(--status-error)]/40",
+  },
+  HIGH: {
+    label: "High",
+    bg: "bg-[color:var(--status-warn-soft)]",
+    text: "text-[var(--status-warn)]",
+    border: "border-[color:var(--status-warn)]/40",
+  },
+  MEDIUM: {
+    label: "Medium",
+    bg: "bg-[color:var(--status-pending-soft)]",
+    text: "text-[var(--status-pending)]",
+    border: "border-[color:var(--status-pending)]/40",
+  },
+  LOW: {
+    label: "Low",
+    bg: "bg-[color:var(--accent-soft)]",
+    text: "text-[var(--accent-strong)]",
+    border: "border-[color:var(--accent)]/30",
+  },
+  UNKNOWN: {
+    label: "Unknown",
+    bg: "bg-[var(--bg-raised)]",
+    text: "text-[var(--ink-tertiary)]",
+    border: "border-[var(--line-medium)]",
+  },
+};
+
+const SEVERITY_ORDER: ScanSeverity[] = [
+  "CRITICAL",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+  "UNKNOWN",
+];
+
+function SecurityPanel({
+  status,
+  result,
+  error,
+}: {
+  status: ScanStatus;
+  result: ScanResult | null;
+  error: string | null;
+}) {
+  return (
+    <section className="reveal reveal-panel panel p-5 sm:p-6">
+      <div className="mb-4 flex items-center gap-3">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[color:var(--accent)]/30 bg-[color:var(--accent-soft)]">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-5 w-5"
+          >
+            <path
+              d="M12 3L4 6.5V12c0 3.87 3.44 7.5 8 9 4.56-1.5 8-5.13 8-9V6.5L12 3Z"
+              stroke="var(--accent-strong)"
+              strokeWidth="1.6"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M9 12l2 2 4-4"
+              stroke="var(--accent-strong)"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </div>
+        <div>
+          <p className="eyebrow">Security</p>
+          <h2 className="mt-0.5 font-display text-xl font-semibold tracking-tight text-[var(--ink-primary)]">
+            Image vulnerability scan
+          </h2>
+        </div>
+      </div>
+
+      {status === "scanning" ? (
+        <div className="flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] px-4 py-3">
+          <ScanSpinner />
+          <p className="text-[13px] text-[var(--ink-secondary)]">
+            Running Trivy scan — pulling vulnerability database and scanning layers…
+          </p>
+        </div>
+      ) : status === "error" ? (
+        <div className="space-y-3">
+          <div className="rounded-xl border border-[color:var(--status-error)]/30 bg-[color:var(--status-error-soft)] px-4 py-3">
+            <p className="font-display text-[11px] font-semibold uppercase tracking-[0.22em] text-[var(--status-error)]">
+              Scan failed
+            </p>
+            <p className="mt-2 text-[13px] leading-6 text-[var(--ink-secondary)]">
+              {error}
+            </p>
+          </div>
+          <p className="text-[12px] leading-6 text-[var(--ink-tertiary)]">
+            Install Trivy:{" "}
+            <code className="rounded bg-[var(--bg-input)] px-1.5 py-0.5 text-[var(--ink-secondary)]">
+              brew install trivy
+            </code>{" "}
+            (macOS) ·{" "}
+            <code className="rounded bg-[var(--bg-input)] px-1.5 py-0.5 text-[var(--ink-secondary)]">
+              apt-get install trivy
+            </code>{" "}
+            (Linux)
+          </p>
+        </div>
+      ) : result ? (
+        <ScanReport result={result} />
+      ) : null}
+    </section>
+  );
+}
+
+function ScanReport({ result }: { result: ScanResult }) {
+  const { summary, vulnerabilities, suggestions, rollbackStrategy, riskLevel } =
+    result;
+
+  const riskBannerStyle =
+    riskLevel === "critical"
+      ? "border-[color:var(--status-error)]/40 bg-[color:var(--status-error-soft)]"
+      : riskLevel === "warn"
+        ? "border-[color:var(--status-warn)]/40 bg-[color:var(--status-warn-soft)]"
+        : "border-[color:var(--status-ok)]/40 bg-[color:var(--status-ok-soft)]";
+
+  const riskLabel =
+    riskLevel === "critical"
+      ? "Critical risk — do not deploy"
+      : riskLevel === "warn"
+        ? "High risk — review before deploying"
+        : "Clean — safe to deploy";
+
+  const riskColor =
+    riskLevel === "critical"
+      ? "text-[var(--status-error)]"
+      : riskLevel === "warn"
+        ? "text-[var(--status-warn)]"
+        : "text-[var(--status-ok)]";
+
+  const total = Object.values(summary).reduce((a, b) => a + b, 0);
+
+  return (
+    <div className="space-y-4">
+      {/* Risk banner + severity breakdown */}
+      <div className={`rounded-xl border p-4 ${riskBannerStyle}`}>
+        <div className="flex items-center gap-2 mb-3">
+          <ShieldIcon riskLevel={riskLevel} />
+          <span
+            className={`font-display text-[13px] font-semibold uppercase tracking-[0.18em] ${riskColor}`}
+          >
+            {riskLabel}
+          </span>
+        </div>
+        <div className="grid grid-cols-5 gap-2">
+          {SEVERITY_ORDER.map((sev) => {
+            const m = SEVERITY_META[sev];
+            const count = summary[sev] ?? 0;
+            return (
+              <div
+                key={sev}
+                className={`rounded-lg border px-2 py-2 text-center ${m.bg} ${m.border}`}
+              >
+                <p className={`numerals text-lg font-semibold ${m.text}`}>
+                  {count}
+                </p>
+                <p
+                  className={`mt-0.5 font-display text-[9px] uppercase tracking-[0.2em] ${m.text} opacity-80`}
+                >
+                  {m.label}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-3 text-[11px] text-[var(--ink-tertiary)]">
+          {total === 0
+            ? "No CVEs detected across all layers."
+            : `${total} CVE${total !== 1 ? "s" : ""} across all layers · scanned ${formatTime(result.scannedAt)}`}
+        </p>
+      </div>
+
+      {/* CVE list */}
+      {vulnerabilities.length > 0 ? (
+        <div>
+          <p className="eyebrow mb-2">
+            Top vulnerabilities ({Math.min(vulnerabilities.length, 25)} shown)
+          </p>
+          <div className="space-y-1.5 max-h-[280px] overflow-auto pr-1">
+            {vulnerabilities.map((v) => (
+              <VulnRow key={`${v.id}-${v.pkg}`} vuln={v} />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-xl border border-[color:var(--status-ok)]/30 bg-[color:var(--status-ok-soft)] px-4 py-3">
+          <p className="text-[13px] text-[var(--ink-secondary)]">
+            No CVEs detected — this image is clean across all scanned layers.
+          </p>
+        </div>
+      )}
+
+      {/* Debug suggestions */}
+      <div>
+        <p className="eyebrow mb-2">Remediation &amp; hardening</p>
+        <div className="space-y-2">
+          {suggestions.map((s, i) => (
+            <div
+              key={i}
+              className="flex gap-3 rounded-xl border border-[var(--line-soft)] bg-[var(--bg-raised)] px-4 py-3"
+            >
+              <span className="numerals mt-0.5 shrink-0 text-[11px] text-[var(--ink-tertiary)]">
+                {String(i + 1).padStart(2, "0")}
+              </span>
+              <p className="text-[13px] leading-6 text-[var(--ink-secondary)]">
+                {s}
+              </p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Rollback strategy */}
+      <div className="panel-raised p-4">
+        <p className="eyebrow mb-2">Rollback strategy</p>
+        <p className="text-[13px] leading-7 text-[var(--ink-secondary)]">
+          {rollbackStrategy}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function VulnRow({ vuln }: { vuln: VulnItem }) {
+  const m = SEVERITY_META[vuln.severity];
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-[var(--line-soft)] bg-[var(--bg-raised)] px-3 py-2.5">
+      <span
+        className={`mt-0.5 shrink-0 rounded-md border px-1.5 py-0.5 font-display text-[9px] uppercase tracking-[0.2em] ${m.bg} ${m.border} ${m.text}`}
+      >
+        {m.label}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span className="font-mono text-[12px] font-semibold text-[var(--ink-primary)]">
+            {vuln.id}
+          </span>
+          <span className="text-[11px] text-[var(--ink-tertiary)]">
+            {vuln.pkg}
+          </span>
+          {vuln.fixedVersion ? (
+            <span className="rounded bg-[color:var(--status-ok-soft)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--status-ok)]">
+              fix: {vuln.fixedVersion}
+            </span>
+          ) : null}
+        </div>
+        <p className="mt-0.5 truncate text-[11px] text-[var(--ink-tertiary)]">
+          {vuln.title}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function ShieldIcon({ riskLevel }: { riskLevel: "safe" | "warn" | "critical" | null }) {
+  const color =
+    riskLevel === "critical"
+      ? "var(--status-error)"
+      : riskLevel === "warn"
+        ? "var(--status-warn)"
+        : riskLevel === "safe"
+          ? "var(--status-ok)"
+          : "var(--ink-tertiary)";
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      className="h-4 w-4 shrink-0"
+    >
+      <path
+        d="M12 3L4 6.5V12c0 3.87 3.44 7.5 8 9 4.56-1.5 8-5.13 8-9V6.5L12 3Z"
+        stroke={color}
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      {riskLevel === "critical" ? (
+        <>
+          <path
+            d="M12 9v3"
+            stroke={color}
+            strokeWidth="1.6"
+            strokeLinecap="round"
+          />
+          <circle cx="12" cy="14.5" r="0.75" fill={color} />
+        </>
+      ) : riskLevel === "safe" ? (
+        <path
+          d="M9 12l2 2 4-4"
+          stroke={color}
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ) : (
+        <path
+          d="M12 9v3M12 14.5v.01"
+          stroke={color}
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        />
+      )}
+    </svg>
+  );
+}
+
+function ScanSpinner() {
+  return (
+    <svg
+      className="h-4 w-4 shrink-0 animate-spin"
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <circle
+        className="opacity-25"
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="3"
+      />
+      <path
+        className="opacity-75"
+        fill="currentColor"
+        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+      />
+    </svg>
   );
 }
