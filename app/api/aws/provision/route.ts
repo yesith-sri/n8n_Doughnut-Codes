@@ -322,6 +322,23 @@ async function ensureEcsServiceLinkedRole(iam: IAMClient) {
   }
 }
 
+async function createEcsServiceWithRoleRetry(
+  ecs: ECSClient,
+  iam: IAMClient,
+  input: ConstructorParameters<typeof CreateServiceCommand>[0],
+) {
+  try {
+    return await ecs.send(new CreateServiceCommand(input));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("service linked role")) throw err;
+
+    await ensureEcsServiceLinkedRole(iam);
+    return ecs.send(new CreateServiceCommand(input));
+  }
+}
+
+
 async function createService(payload: ProvisionPayload) {
   const image = payload.image?.trim();
   if (!image) {
@@ -348,7 +365,6 @@ async function createService(payload: ProvisionPayload) {
 
   try {
     await ecs.send(new CreateClusterCommand({ clusterName }));
-    await ensureEcsServiceLinkedRole(iam);
     const networking = await getNetworking(ec2, serviceName, port);
 
     const taskDefinition = await ecs.send(
@@ -371,8 +387,7 @@ async function createService(payload: ProvisionPayload) {
       }),
     );
 
-    const service = await ecs.send(
-      new CreateServiceCommand({
+    const service = await createEcsServiceWithRoleRetry(ecs, iam, {
         cluster: clusterName,
         serviceName,
         taskDefinition: taskDefinition.taskDefinition?.taskDefinitionArn,
@@ -385,8 +400,7 @@ async function createService(payload: ProvisionPayload) {
             assignPublicIp: "ENABLED",
           },
         },
-      }),
-    );
+      });
 
     return json(200, {
       ok: true,
