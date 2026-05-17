@@ -37,6 +37,8 @@ Restart `bun run dev` after editing `.env.local`.
 
 > **About `/api/scan`:** the route was originally a thin wrapper around the `trivy` CLI, which can't run on Vercel (no binaries, no Docker daemon). It now calls the hosted Trivy wrapper at `TRIVVY_API` first, and falls back to the NIST NVD API if Trivy is unreachable. Both paths run server-side and return the same JSON shape.
 
+> If your DigitalOcean box is running stock `trivy server`, expose the REST wrapper from [`docs/trivy-wrapper.md`](docs/trivy-wrapper.md). Vercel should call that wrapper, not the raw Twirp/RPC server.
+
 > **About `/api/azure/provision`:** mirrors `/api/aws/provision`. Accepts `{ action: "create" | "status", projectName, image, port, memoryMB, cpuLimit, healthCheckPath, region, envVars, deploymentId }`. On `create` it idempotently ensures the resource group + Managed Environment exist, deploys the Container App, waits for `provisioningState === "Succeeded"`, and returns the public `serviceUrl` (`https://<appname>.<env-default-domain>`). On `status` it re-fetches the app for health-check polling. The response also exposes `clusterName` (= resource group) and `serviceName` (= container app name) so the existing AWS-shaped downstream n8n nodes keep working unchanged.
 
 ---
