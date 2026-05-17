@@ -403,30 +403,173 @@ function mapToVulnItem(cve: NvdCve, parsed: ParsedImage): VulnItem {
   };
 }
 
-// ---------- Optional self-hosted Trivy server delegate ---------------------
+// ---------- Hosted Trivy API delegate --------------------------------------
 
-async function tryTrivyServer(image: string): Promise<ScanResponse | null> {
-  const url = process.env.TRIVY_SERVER_URL?.trim();
-  if (!url) return null;
+/** Native Trivy JSON shape (what `trivy image --format json` emits). */
+type TrivyNativeVuln = {
+  VulnerabilityID: string;
+  PkgName: string;
+  InstalledVersion?: string;
+  FixedVersion?: string;
+  Severity: string;
+  Title?: string;
+  Description?: string;
+};
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ image }),
-      signal: AbortSignal.timeout(45_000),
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as Partial<ScanResponse>;
-    // Minimal validation — the server is expected to speak our exact schema.
-    if (data && typeof data === "object" && Array.isArray(data.vulnerabilities)) {
-      return data as ScanResponse;
+type TrivyNativeResult = {
+  Target: string;
+  Type?: string;
+  Vulnerabilities?: TrivyNativeVuln[];
+};
+
+type TrivyNativeReport = {
+  SchemaVersion?: number;
+  ArtifactName?: string;
+  Results?: TrivyNativeResult[];
+};
+
+function normalizeSeverity(s: string | undefined): Severity {
+  const u = (s ?? "").toUpperCase();
+  if (u === "CRITICAL" || u === "HIGH" || u === "MEDIUM" || u === "LOW") return u;
+  return "UNKNOWN";
+}
+
+function trivyNativeToScanResponse(
+  image: string,
+  report: TrivyNativeReport,
+): ScanResponse {
+  const flat: VulnItem[] = [];
+  for (const r of report.Results ?? []) {
+    for (const v of r.Vulnerabilities ?? []) {
+      flat.push({
+        id: v.VulnerabilityID,
+        pkg: v.PkgName,
+        target: r.Target,
+        installedVersion: v.InstalledVersion ?? "",
+        fixedVersion: v.FixedVersion ?? "",
+        severity: normalizeSeverity(v.Severity),
+        title: (v.Title ?? v.Description ?? v.VulnerabilityID).slice(0, 240),
+      });
     }
-    return null;
-  } catch {
-    return null;
   }
+  flat.sort(
+    (a, b) =>
+      (SEVERITY_RANK[a.severity] ?? 5) - (SEVERITY_RANK[b.severity] ?? 5),
+  );
+
+  const summary = buildSummary(flat);
+  const parsed = parseImage(image);
+  return {
+    image,
+    scannedAt: new Date().toISOString(),
+    summary,
+    vulnerabilities: flat.slice(0, 25),
+    suggestions: generateSuggestions(
+      flat,
+      parsed,
+      parsed.vendor ? "cpe" : "unmapped",
+    ),
+    rollbackStrategy: generateRollbackStrategy(summary, image),
+    riskLevel: toRiskLevel(summary),
+  };
+}
+
+function isOurScanResponse(data: unknown): data is ScanResponse {
+  return (
+    !!data &&
+    typeof data === "object" &&
+    "vulnerabilities" in data &&
+    Array.isArray((data as { vulnerabilities: unknown }).vulnerabilities) &&
+    "summary" in data
+  );
+}
+
+function isTrivyNative(data: unknown): data is TrivyNativeReport {
+  return (
+    !!data &&
+    typeof data === "object" &&
+    "Results" in data &&
+    Array.isArray((data as { Results: unknown }).Results)
+  );
+}
+
+/**
+ * Try the hosted Trivy API (TRIVVY_API + TRIVVY_API_KEY) across the common
+ * endpoint shapes. Returns null on any failure so the caller can fall back.
+ */
+async function tryHostedTrivy(image: string): Promise<ScanResponse | null> {
+  const baseRaw = (process.env.TRIVVY_API ?? process.env.TRIVY_API ?? process.env.TRIVY_SERVER_URL)?.trim();
+  if (!baseRaw) return null;
+  const base = baseRaw.replace(/\/+$/, "");
+  const apiKey = (process.env.TRIVVY_API_KEY ?? process.env.TRIVY_API_KEY)?.trim();
+
+  const authHeaders: Record<string, string> = {};
+  if (apiKey) {
+    // Primary: the hosted wrapper expects a raw token in `Trivy-Token`
+    // (no `Bearer ` prefix). `X-API-Key` is sent as a harmless fallback so
+    // alternate wrappers still authenticate.
+    authHeaders["trivy-token"] = apiKey;
+    authHeaders["x-api-key"] = apiKey;
+  }
+
+  const attempts: Array<{ url: string; init: RequestInit }> = [
+    {
+      url: `${base}/scan`,
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify({ image }),
+      },
+    },
+    {
+      url: `${base}/api/scan`,
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify({ image }),
+      },
+    },
+    {
+      url: `${base}/v1/scan`,
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify({ image }),
+      },
+    },
+    {
+      url: `${base}/scan/${encodeURIComponent(image)}`,
+      init: { method: "GET", headers: { ...authHeaders } },
+    },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const res = await fetch(attempt.url, {
+        ...attempt.init,
+        signal: AbortSignal.timeout(60_000),
+        cache: "no-store",
+      });
+      if (!res.ok) continue;
+      const data: unknown = await res.json();
+
+      if (isOurScanResponse(data)) return data;
+      if (isTrivyNative(data)) return trivyNativeToScanResponse(image, data);
+      // Some wrappers nest the Trivy payload under a key
+      if (data && typeof data === "object") {
+        const inner =
+          (data as Record<string, unknown>).report ??
+          (data as Record<string, unknown>).result ??
+          (data as Record<string, unknown>).data;
+        if (isOurScanResponse(inner)) return inner;
+        if (isTrivyNative(inner)) return trivyNativeToScanResponse(image, inner);
+      }
+    } catch {
+      // try next pattern
+    }
+  }
+
+  return null;
 }
 
 // ---------- Aggregation helpers --------------------------------------------
@@ -566,13 +709,17 @@ export async function POST(request: Request): Promise<Response> {
     return jsonError(400, "Missing or empty 'dockerImageUrl' in request body.");
   }
 
-  // Delegate to a self-hosted Trivy server if configured (preferred — gives
-  // layer-level coverage). Falls through silently to NVD on any failure.
-  const trivyReport = await tryTrivyServer(image);
+  // Preferred: delegate to the hosted Trivy API (TRIVVY_API + TRIVVY_API_KEY).
+  // Falls through silently to NVD on any failure so the scan never dies on
+  // a Trivy outage.
+  const trivyReport = await tryHostedTrivy(image);
   if (trivyReport) {
     return new Response(JSON.stringify(trivyReport), {
       status: 200,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-forge-scan-source": "trivy",
+      },
     });
   }
 
@@ -626,6 +773,9 @@ export async function POST(request: Request): Promise<Response> {
 
   return new Response(JSON.stringify(response), {
     status: 200,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "x-forge-scan-source": "nvd",
+    },
   });
 }

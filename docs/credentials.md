@@ -22,12 +22,80 @@ Copy `.env.example` to `.env.local` and fill it in.
 | `AWS_SUBNET_IDS` *(optional)* | `.env.local` on the Forge server | Comma-separated public subnet IDs. If omitted, the provisioner uses default VPC subnets. |
 | `AWS_SECURITY_GROUP_ID` *(optional)* | `.env.local` on the Forge server | Security group with inbound access to the container port. If omitted, the provisioner creates one. |
 | `AWS_ECS_TASK_EXECUTION_ROLE_ARN` *(optional for public Docker Hub)* | `.env.local` on the Forge server | ECS task execution role. Recommended if you later add CloudWatch logs or private registries. |
-| `NVD_API_KEY` *(optional)* | `.env.local` / Vercel env | Lifts the NIST NVD rate limit on `/api/scan` from 5 req/30 s to 50 req/30 s. Free at https://nvd.nist.gov/developers/request-an-api-key. Without it, scans still work but the page may show "NVD HTTP 403/429" if hit rapidly. |
-| `TRIVY_SERVER_URL` *(optional)* | `.env.local` / Vercel env | If set, `/api/scan` posts `{ image }` here first and returns the response verbatim. Use this when you self-host Trivy and want layer-level OS-package CVEs instead of the NVD CPE-based scan. Endpoint must speak the same JSON shape as `/api/scan` (`{ image, scannedAt, summary, vulnerabilities, suggestions, rollbackStrategy, riskLevel }`). |
+| `TRIVVY_API` | `.env.local` / Vercel env | Base URL of the hosted Trivy wrapper (Digital Ocean droplet). `/api/scan` tries `POST {TRIVVY_API}/scan`, `POST {TRIVVY_API}/api/scan`, `POST {TRIVVY_API}/v1/scan`, and `GET {TRIVVY_API}/scan/{image}` in that order, accepting either our `ScanResponse` shape or native Trivy JSON. |
+| `TRIVVY_API_KEY` | `.env.local` / Vercel env | API key for the hosted Trivy wrapper. Sent as `Trivy-Token: <key>` (raw, **no** `Bearer` prefix). Also mirrored to `X-API-Key` as a harmless fallback. |
+| `NVD_API_KEY` *(optional)* | `.env.local` / Vercel env | Used only when the hosted Trivy is unreachable and `/api/scan` falls back to NIST NVD. Lifts the NVD rate limit from 5 req/30 s to 50 req/30 s. Free at https://nvd.nist.gov/developers/request-an-api-key. |
+| `TENANT_ID` | `.env.local` / Vercel env | Azure service-principal tenant ID. Used by `/api/azure/provision` to authenticate via `ClientSecretCredential`. |
+| `CLIENT_ID` | `.env.local` / Vercel env | Azure service-principal app (client) ID. |
+| `CLIENT_SECRET` | `.env.local` / Vercel env | Azure service-principal client secret. Treat as sensitive — never commit. |
+| `AZURE_SUBSCRIPTION_ID` | `.env.local` / Vercel env | Subscription where the Container App + Managed Environment will be provisioned. |
+| `AZURE_REGION` | `.env.local` / Vercel env | Default region for Azure provisioning. Example: `eastus`. Falls back to `eastus` if unset. |
+| `AZURE_RESOURCE_GROUP` | `.env.local` / Vercel env | Resource group name used by `/api/azure/provision`. Example: `n8n_rg`. Created idempotently on first deploy. |
+| `AZURE_CONTAINER_APP_ENV` *(optional)* | `.env.local` / Vercel env | Name of the Container App Managed Environment to reuse. Defaults to `forge-aca-env`; created on demand if missing. First-time creation can take 2-5 minutes. |
 
 Restart `bun run dev` after editing `.env.local`.
 
-> **About `/api/scan`:** the route was originally a thin wrapper around the `trivy` CLI, which can't run on Vercel (no binaries, no Docker daemon). It now calls the NIST NVD API directly to fetch CVEs for the image's primary application + version (e.g. `nginx 1.20.0`). For OS-package-layer CVEs you need a real Trivy — point `TRIVY_SERVER_URL` at one and the scan will delegate.
+> **About `/api/scan`:** the route was originally a thin wrapper around the `trivy` CLI, which can't run on Vercel (no binaries, no Docker daemon). It now calls the hosted Trivy wrapper at `TRIVVY_API` first, and falls back to the NIST NVD API if Trivy is unreachable. Both paths run server-side and return the same JSON shape.
+
+> If your DigitalOcean box is running stock `trivy server`, expose the REST wrapper from [`docs/trivy-wrapper.md`](docs/trivy-wrapper.md). Vercel should call that wrapper, not the raw Twirp/RPC server.
+
+> **About `/api/azure/provision`:** mirrors `/api/aws/provision`. Accepts `{ action: "create" | "status", projectName, image, port, memoryMB, cpuLimit, healthCheckPath, region, envVars, deploymentId }`. On `create` it idempotently ensures the resource group + Managed Environment exist, deploys the Container App, waits for `provisioningState === "Succeeded"`, and returns the public `serviceUrl` (`https://<appname>.<env-default-domain>`). On `status` it re-fetches the app for health-check polling. The response also exposes `clusterName` (= resource group) and `serviceName` (= container app name) so the existing AWS-shaped downstream n8n nodes keep working unchanged.
+
+---
+
+## 4. Required n8n workflow tweaks (apply once in the n8n UI)
+
+Workflow id: `Co7HN1Zf7FQT6YSa` (`Agentic IDP — AWS Docker Hub ECS POC Pipeline`).
+
+The base workflow is AWS-only. Apply these four surgical edits to make `provider="azure"` flow through the same chain. Total time in the n8n UI: ~2 minutes. **Do not** rename or move nodes — only edit the highlighted field on each.
+
+### 4.1 `Check AWS Provider` (IF node)
+
+Replace the single condition so both `aws` and `azure` are accepted:
+
+- Operation: **equals** → keep
+- Condition value 1: `{{ ["aws", "azure"].includes($json.provider) }}` (use the **boolean / expression** comparator), OR
+- Add a second condition via the OR combinator: `={{ $json.provider }}` equals `"azure"`.
+
+Rename the node to **`Check Supported Provider`** if you like — purely cosmetic.
+
+### 4.2 `Capture Approval` (Set node)
+
+Two fields to edit, both currently hardcoded to AWS:
+
+- `provider` — change from the string `"aws"` to expression:
+  `={{ $("Extract Final Decision").item.json.provider }}`
+- `forgeProvisionerUrl` — change from `={{ $("Cost Estimator").item.json.forgeProvisionerUrl }}` to expression:
+  `={{ $env.WEBSITE_URL + "/api/" + $("Extract Final Decision").item.json.provider }}`
+
+That single expression resolves to `https://<your-vercel-url>/api/aws` or `.../api/azure` depending on the user's pick. The downstream `Provision AWS ECS` node already appends `/provision`, so both routes are reached correctly.
+
+### 4.3 `Extract AWS URL` (Set node)
+
+- `provider` — change from `"aws"` to expression:
+  `={{ $("Capture Approval").item.json.provider }}`
+
+### 4.4 `Prepare AWS Deployment` (Set node)
+
+Change the `region` fallback to be provider-aware so Azure deploys land in `eastus` instead of `us-east-1`:
+
+- `region` — change from `={{ $json.deployConfig.region || $env.AWS_REGION || "us-east-1" }}` to:
+  `={{ $json.deployConfig.region || ($("Capture Approval").item.json.provider === "azure" ? ($env.AZURE_REGION || "eastus") : ($env.AWS_REGION || "us-east-1")) }}`
+
+After those four edits, save the workflow (it's already activated). The chat → final → deploy chain now supports both AWS and Azure with no other changes.
+
+### Optional: rename for clarity
+
+If the AWS-named nodes annoy you visually, you can rename:
+
+- `Check AWS Provider` → `Check Supported Provider`
+- `Prepare AWS Deployment` → `Prepare Deployment`
+- `Provision AWS ECS` → `Provision Container Service`
+- `Wait for ECS Ready` → `Wait for Service Ready`
+- `Describe AWS ECS` → `Describe Service`
+- `Extract AWS URL` → `Extract Service URL`
+
+Don't change the connections — n8n picks them up by id, not name.
 
 > The browser never holds AWS / GCP / Azure secrets. For the AWS POC, AWS keys live on the Forge server and are used only by the server-side `/api/aws/provision` route; n8n remains the brain that decides when to call it.
 
