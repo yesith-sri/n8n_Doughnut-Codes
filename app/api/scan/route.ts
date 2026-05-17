@@ -505,8 +505,10 @@ async function tryHostedTrivy(image: string): Promise<ScanResponse | null> {
 
   const authHeaders: Record<string, string> = {};
   if (apiKey) {
-    // Send both. APIs that don't recognize one ignore it.
-    authHeaders["authorization"] = `Bearer ${apiKey}`;
+    // Primary: the hosted wrapper expects a raw token in `Trivy-Token`
+    // (no `Bearer ` prefix). `X-API-Key` is sent as a harmless fallback so
+    // alternate wrappers still authenticate.
+    authHeaders["trivy-token"] = apiKey;
     authHeaders["x-api-key"] = apiKey;
   }
 
