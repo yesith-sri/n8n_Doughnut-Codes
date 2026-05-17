@@ -193,8 +193,19 @@ async function ensureResourceGroup(
   resourceGroup: string,
   region: string,
 ) {
-  // createOrUpdate is idempotent — calling it on an existing RG just updates
-  // the tags, which is fine.
+  try {
+    const existing = await resources.resourceGroups.get(resourceGroup);
+    if (existing?.id) return;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // If the service principal only has Contributor on the RG (not subscription
+    // scope), even reading/updating the RG metadata can be denied. Continue and
+    // let the Container Apps calls prove whether it can manage resources inside
+    // the group. This avoids requiring subscription-level permissions for demos.
+    if (/authorization|forbidden|does not have authorization/i.test(message)) return;
+    if (!/not.?found|ResourceGroupNotFound|ResourceNotFound/i.test(message)) throw err;
+  }
+
   await resources.resourceGroups.createOrUpdate(resourceGroup, {
     location: region,
     tags: { managedBy: "forge-mvp" },
