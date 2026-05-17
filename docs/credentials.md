@@ -22,8 +22,12 @@ Copy `.env.example` to `.env.local` and fill it in.
 | `AWS_SUBNET_IDS` *(optional)* | `.env.local` on the Forge server | Comma-separated public subnet IDs. If omitted, the provisioner uses default VPC subnets. |
 | `AWS_SECURITY_GROUP_ID` *(optional)* | `.env.local` on the Forge server | Security group with inbound access to the container port. If omitted, the provisioner creates one. |
 | `AWS_ECS_TASK_EXECUTION_ROLE_ARN` *(optional for public Docker Hub)* | `.env.local` on the Forge server | ECS task execution role. Recommended if you later add CloudWatch logs or private registries. |
+| `NVD_API_KEY` *(optional)* | `.env.local` / Vercel env | Lifts the NIST NVD rate limit on `/api/scan` from 5 req/30 s to 50 req/30 s. Free at https://nvd.nist.gov/developers/request-an-api-key. Without it, scans still work but the page may show "NVD HTTP 403/429" if hit rapidly. |
+| `TRIVY_SERVER_URL` *(optional)* | `.env.local` / Vercel env | If set, `/api/scan` posts `{ image }` here first and returns the response verbatim. Use this when you self-host Trivy and want layer-level OS-package CVEs instead of the NVD CPE-based scan. Endpoint must speak the same JSON shape as `/api/scan` (`{ image, scannedAt, summary, vulnerabilities, suggestions, rollbackStrategy, riskLevel }`). |
 
 Restart `bun run dev` after editing `.env.local`.
+
+> **About `/api/scan`:** the route was originally a thin wrapper around the `trivy` CLI, which can't run on Vercel (no binaries, no Docker daemon). It now calls the NIST NVD API directly to fetch CVEs for the image's primary application + version (e.g. `nginx 1.20.0`). For OS-package-layer CVEs you need a real Trivy — point `TRIVY_SERVER_URL` at one and the scan will delegate.
 
 > The browser never holds AWS / GCP / Azure secrets. For the AWS POC, AWS keys live on the Forge server and are used only by the server-side `/api/aws/provision` route; n8n remains the brain that decides when to call it.
 

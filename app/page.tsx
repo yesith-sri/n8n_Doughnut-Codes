@@ -894,7 +894,7 @@ export default function Home() {
                       onClick={scanImage}
                       disabled={scanStatus === "scanning" || !dockerImage.trim()}
                       className="btn-ghost shrink-0"
-                      title="Scan image for CVEs using Trivy"
+                      title="Scan image for CVEs (NIST NVD)"
                     >
                       {scanStatus === "scanning" ? (
                         <span className="flex items-center gap-2">
@@ -1644,7 +1644,7 @@ function SecurityPanel({
         <div className="flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/20 bg-[color:var(--accent-soft)] px-4 py-3">
           <ScanSpinner />
           <p className="text-[13px] text-[var(--ink-secondary)]">
-            Running Trivy scan — pulling vulnerability database and scanning layers…
+            Querying the NIST NVD CVE database for this image…
           </p>
         </div>
       ) : status === "error" ? (
@@ -1658,15 +1658,15 @@ function SecurityPanel({
             </p>
           </div>
           <p className="text-[12px] leading-6 text-[var(--ink-tertiary)]">
-            Install Trivy:{" "}
+            NVD rate-limits unauthenticated callers to 5 requests / 30 s. Set{" "}
             <code className="rounded bg-[var(--bg-input)] px-1.5 py-0.5 text-[var(--ink-secondary)]">
-              brew install trivy
+              NVD_API_KEY
             </code>{" "}
-            (macOS) ·{" "}
+            in your Vercel env to raise that to 50. Or point{" "}
             <code className="rounded bg-[var(--bg-input)] px-1.5 py-0.5 text-[var(--ink-secondary)]">
-              apt-get install trivy
+              TRIVY_SERVER_URL
             </code>{" "}
-            (Linux)
+            at a self-hosted Trivy for layer-deep scans.
           </p>
         </div>
       ) : result ? (
