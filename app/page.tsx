@@ -29,6 +29,19 @@ gsap.registerPlugin(useGSAP);
 
 type Provider = "aws" | "gcp" | "azure";
 
+type DeploymentToolId = "ecs" | "aca" | "app-runner";
+
+type DeploymentTool = {
+  id: DeploymentToolId;
+  provider: Provider;
+  label: string;
+  shortLabel: string;
+  region: string;
+  configured: boolean;
+  status: "ready" | "unconfigured";
+  description: string;
+};
+
 type Status =
   | "idle"
   | "submitting"
@@ -113,6 +126,39 @@ const PROVIDERS: { id: Provider; label: string; tag: string }[] = [
   { id: "aws", label: "AWS Fargate", tag: "us-east-1" },
   { id: "gcp", label: "GCP Cloud Run", tag: "us-central1" },
   { id: "azure", label: "Azure Container Apps", tag: "eastus" },
+];
+
+const DEPLOYMENT_TOOLS: DeploymentTool[] = [
+  {
+    id: "ecs",
+    provider: "aws",
+    label: "AWS ECS Fargate",
+    shortLabel: "ECS",
+    region: "us-east-1",
+    configured: true,
+    status: "ready",
+    description: "Existing AWS branch. Best when you want mature networking and ECS service health.",
+  },
+  {
+    id: "aca",
+    provider: "azure",
+    label: "Azure Container Apps",
+    shortLabel: "ACA",
+    region: "southeastasia",
+    configured: true,
+    status: "ready",
+    description: "New Azure branch. Best for serverless containers with public ingress and scale-to-zero.",
+  },
+  {
+    id: "app-runner",
+    provider: "aws",
+    label: "AWS App Runner",
+    shortLabel: "App Runner",
+    region: "not wired",
+    configured: false,
+    status: "unconfigured",
+    description: "Parked for later. Shown here so judges see the routing model is extensible.",
+  },
 ];
 
 const PIPELINE_LABELS: { id: string; label: string; detail: string }[] = [
@@ -267,6 +313,29 @@ function pipelineFromStatus(
         : p.detail,
     state: order[i],
   }));
+}
+
+function costForTool(tool: DeploymentTool, costs: DeploymentResponse["costs"]) {
+  if (!tool.configured) return 0;
+  return costs[tool.provider] ?? 0;
+}
+
+function pickBestTool(
+  deployment: DeploymentResponse | null,
+  costs: DeploymentResponse["costs"],
+): DeploymentTool | null {
+  const configured = DEPLOYMENT_TOOLS.filter((tool) => tool.configured);
+  if (!deployment) return configured[0] ?? null;
+
+  const recommendedProvider = deployment.recommendedProvider as Provider | string;
+  const matchingRecommendation = configured.find(
+    (tool) => tool.provider === recommendedProvider,
+  );
+  if (matchingRecommendation) return matchingRecommendation;
+
+  return configured
+    .filter((tool) => costForTool(tool, costs) > 0)
+    .sort((a, b) => costForTool(a, costs) - costForTool(b, costs))[0] ?? configured[0] ?? null;
 }
 
 export default function Home() {
@@ -781,6 +850,18 @@ export default function Home() {
   const cheapest = cheapestEntry?.[0];
   const recommended =
     (deployment?.recommendedProvider as Provider | undefined) ?? null;
+  const bestTool = pickBestTool(deployment, costs);
+  const approvalWarnings = [
+    scanResult?.riskLevel === "critical"
+      ? "Critical CVEs found. Reject or rebuild before approval unless this is a controlled demo."
+      : null,
+    !currentResumeUrl && status === "pending_approval"
+      ? "Missing active resume URL. Chat/final approval cannot reach n8n."
+      : null,
+    deployment && !bestTool
+      ? "No configured deployment tool is available for this recommendation."
+      : null,
+  ].filter(Boolean) as string[];
 
   const isSubmitting = status === "submitting";
   const isAdvising = status === "pending_approval";
@@ -866,6 +947,14 @@ export default function Home() {
           </div>
           <PipelineCanvas stages={stages} className="h-[340px] w-full" />
         </section>
+
+        <AgentDashboard
+          deployment={deployment}
+          status={status}
+          scanResult={scanResult}
+          currentResumeUrl={currentResumeUrl}
+          bestTool={bestTool}
+        />
 
         {/* ============== TWO-COLUMN MAIN ============== */}
         <section className="grid gap-6 xl:grid-cols-12">
@@ -1069,6 +1158,14 @@ export default function Home() {
 
           {/* ====== RIGHT COLUMN ====== */}
           <div className="flex flex-col gap-6 xl:col-span-5">
+            <ApprovalCenter
+              status={status}
+              deployment={deployment}
+              currentResumeUrl={currentResumeUrl}
+              bestTool={bestTool}
+              warnings={approvalWarnings}
+            />
+
             {/* ADVISOR CHAT */}
             <Panel
               eyebrow="Human in the loop"
@@ -1130,6 +1227,24 @@ export default function Home() {
                         </button>
                       </div>
 
+                      <div className="flex flex-wrap gap-2">
+                        {[
+                          "Why did the Cost Optimizer prefer this route?",
+                          "Compare ECS vs ACA for this image.",
+                          "What should block approval right now?",
+                        ].map((prompt) => (
+                          <button
+                            key={prompt}
+                            type="button"
+                            onClick={() => sendChatMessage(prompt)}
+                            disabled={isChatting || !currentResumeUrl}
+                            className="rounded-full border border-[var(--line-soft)] bg-[var(--bg-raised)] px-3 py-1.5 text-left text-[11px] text-[var(--ink-secondary)] transition hover:border-[color:var(--accent)]/40 hover:text-[var(--ink-primary)] disabled:opacity-40"
+                          >
+                            {prompt}
+                          </button>
+                        ))}
+                      </div>
+
                       <div className="rounded-xl border border-[var(--line-soft)] bg-[var(--bg-input)]/40 p-3">
                         <p className="eyebrow mb-2">Commit a final decision</p>
                         <div className="grid gap-2 sm:grid-cols-2">
@@ -1171,50 +1286,13 @@ export default function Home() {
               )}
             </Panel>
 
-            {/* COST */}
-            <Panel eyebrow="Routing" title="Cost comparison">
-              <div className="space-y-3">
-                {PROVIDERS.map((p) => {
-                  const cost = costs[p.id];
-                  const isRecommended = recommended === p.id;
-                  const isCheapest = cheapest === p.id;
-                  return (
-                    <div
-                      key={p.id}
-                      className={[
-                        "flex items-center justify-between rounded-xl border p-4 transition",
-                        isRecommended
-                          ? "border-[color:var(--brand)]/30 bg-[color:var(--brand-soft)]"
-                          : "border-[var(--line-soft)] bg-[var(--bg-raised)]",
-                      ].join(" ")}
-                    >
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <p className="font-display text-sm font-semibold text-[var(--ink-primary)]">
-                            {p.label}
-                          </p>
-                          {isRecommended ? (
-                            <Flag label="recommended" tone="brand" />
-                          ) : null}
-                          {isCheapest && !isRecommended ? (
-                            <Flag label="cheapest" tone="ok" />
-                          ) : null}
-                        </div>
-                        <p className="mt-1 text-[12px] text-[var(--ink-tertiary)]">
-                          Region {p.tag} · monthly estimate
-                        </p>
-                      </div>
-                      <p className="numerals text-xl font-semibold text-[var(--ink-primary)]">
-                        {cost > 0 ? `$${cost}` : "—"}
-                        <span className="ml-0.5 text-[12px] font-normal text-[var(--ink-tertiary)]">
-                          /mo
-                        </span>
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-            </Panel>
+            <CostOptimizerPanel
+              costs={costs}
+              recommended={recommended}
+              cheapest={cheapest}
+              bestTool={bestTool}
+              deployment={deployment}
+            />
 
             {/* LOGS */}
             <Panel eyebrow="Logs" title="Live activity">
@@ -1378,6 +1456,295 @@ function StatusBanner({ status }: { status: Status }) {
         {meta.label}
       </p>
       <p className="mt-2 text-[13px] leading-6">{meta.description}</p>
+    </div>
+  );
+}
+
+function AgentDashboard({
+  deployment,
+  status,
+  scanResult,
+  currentResumeUrl,
+  bestTool,
+}: {
+  deployment: DeploymentResponse | null;
+  status: Status;
+  scanResult: ScanResult | null;
+  currentResumeUrl: string | null;
+  bestTool: DeploymentTool | null;
+}) {
+  const agentRows = [
+    {
+      name: "Analyzer Agent",
+      state: deployment ? "done" : status === "submitting" ? "active" : "pending",
+      output: deployment
+        ? `${deployment.runtime} · port ${deployment.ports} · ${deployment.memoryMB}MB`
+        : "Waiting for Docker image analysis",
+    },
+    {
+      name: "Architect Agent",
+      state: deployment ? "done" : "pending",
+      output: deployment?.architecture ?? "Selects the cloud deployment shape",
+    },
+    {
+      name: "Cost Optimizer",
+      state: deployment ? "done" : "pending",
+      output: bestTool
+        ? `Best available route: ${bestTool.shortLabel}`
+        : "Ranks ECS vs ACA after costs arrive",
+    },
+    {
+      name: "Security Scanner",
+      state: scanResult
+        ? scanResult.riskLevel === "critical"
+          ? "failed"
+          : "done"
+        : "pending",
+      output: scanResult
+        ? `${scanResult.summary.CRITICAL} critical / ${scanResult.summary.HIGH} high`
+        : "Optional image CVE check before approval",
+    },
+    {
+      name: "Advisor Chat Agent",
+      state: currentResumeUrl ? "active" : deployment ? "pending" : "pending",
+      output: currentResumeUrl
+        ? "Resume webhook armed for chat + final approval"
+        : "Needs n8n resume URL",
+    },
+    {
+      name: "Deploy + Debugger Agents",
+      state:
+        status === "deploying"
+          ? "active"
+          : status === "failed" || status === "unhealthy"
+            ? "failed"
+            : status === "deployed"
+              ? "done"
+              : "pending",
+      output:
+        status === "deploying"
+          ? "Provider branch is running"
+          : "Runs ECS or ACA, then debugger handles failed health checks",
+    },
+  ];
+
+  return (
+    <Panel eyebrow="Agent crew" title="n8n AI agent dashboard">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {agentRows.map((agent) => (
+          <AgentCard
+            key={agent.name}
+            name={agent.name}
+            state={agent.state}
+            output={agent.output}
+          />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function AgentCard({
+  name,
+  state,
+  output,
+}: {
+  name: string;
+  state: "done" | "active" | "pending" | "failed";
+  output: string;
+}) {
+  const tone =
+    state === "done"
+      ? "border-[color:var(--status-ok)]/30 bg-[color:var(--status-ok-soft)]"
+      : state === "active"
+        ? "border-[color:var(--brand)]/40 bg-[color:var(--brand-soft)]"
+        : state === "failed"
+          ? "border-[color:var(--status-error)]/40 bg-[color:var(--status-error-soft)]"
+          : "border-[var(--line-soft)] bg-[var(--bg-raised)]";
+  return (
+    <div className={`rounded-xl border p-4 ${tone}`}>
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-display text-[13px] font-semibold text-[var(--ink-primary)]">
+          {name}
+        </p>
+        <span className="rounded-full border border-[var(--line-medium)] bg-[var(--bg-input)] px-2 py-0.5 font-display text-[9px] uppercase tracking-[0.2em] text-[var(--ink-tertiary)]">
+          {state}
+        </span>
+      </div>
+      <p className="mt-2 text-[12px] leading-6 text-[var(--ink-secondary)]">
+        {output}
+      </p>
+    </div>
+  );
+}
+
+function ApprovalCenter({
+  status,
+  deployment,
+  currentResumeUrl,
+  bestTool,
+  warnings,
+}: {
+  status: Status;
+  deployment: DeploymentResponse | null;
+  currentResumeUrl: string | null;
+  bestTool: DeploymentTool | null;
+  warnings: string[];
+}) {
+  const ready = Boolean(deployment && currentResumeUrl && warnings.length === 0);
+  return (
+    <Panel eyebrow="Approval" title="Human approval center">
+      <div className="space-y-3">
+        <div
+          className={[
+            "rounded-xl border p-4",
+            ready
+              ? "border-[color:var(--status-ok)]/30 bg-[color:var(--status-ok-soft)]"
+              : "border-[color:var(--status-pending)]/30 bg-[color:var(--status-pending-soft)]",
+          ].join(" ")}
+        >
+          <p className="font-display text-[13px] font-semibold uppercase tracking-[0.18em] text-[var(--ink-primary)]">
+            {ready ? "Ready for final decision" : "Waiting for approval context"}
+          </p>
+          <p className="mt-2 text-[13px] leading-6 text-[var(--ink-secondary)]">
+            {deployment
+              ? `n8n has analyzed ${deployment.dockerImageUrl}. Best configured target: ${bestTool?.label ?? "—"}.`
+              : "Submit an image to n8n first. The approval buttons stay disabled until a resume webhook exists."}
+          </p>
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-3">
+          <ChecklistPill label="n8n intake" ok={Boolean(deployment)} />
+          <ChecklistPill label="resume webhook" ok={Boolean(currentResumeUrl)} />
+          <ChecklistPill label="advisor stage" ok={status === "pending_approval"} />
+        </div>
+
+        {warnings.length ? (
+          <div className="space-y-2">
+            {warnings.map((warning) => (
+              <p
+                key={warning}
+                className="rounded-xl border border-[color:var(--status-warn)]/30 bg-[color:var(--status-warn-soft)] px-3 py-2 text-[12px] leading-6 text-[var(--ink-primary)]"
+              >
+                {warning}
+              </p>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </Panel>
+  );
+}
+
+function ChecklistPill({ label, ok }: { label: string; ok: boolean }) {
+  return (
+    <div className="rounded-lg border border-[var(--line-soft)] bg-[var(--bg-raised)] px-3 py-2">
+      <p className="font-display text-[10px] uppercase tracking-[0.2em] text-[var(--ink-tertiary)]">
+        {label}
+      </p>
+      <p className={ok ? "mt-1 text-[12px] text-[var(--status-ok)]" : "mt-1 text-[12px] text-[var(--status-pending)]"}>
+        {ok ? "ready" : "pending"}
+      </p>
+    </div>
+  );
+}
+
+function CostOptimizerPanel({
+  costs,
+  recommended,
+  cheapest,
+  bestTool,
+  deployment,
+}: {
+  costs: DeploymentResponse["costs"];
+  recommended: Provider | null;
+  cheapest: Provider | undefined;
+  bestTool: DeploymentTool | null;
+  deployment: DeploymentResponse | null;
+}) {
+  return (
+    <Panel eyebrow="Cost optimizer" title="Best deployment tool">
+      <div className="space-y-4">
+        <div className="rounded-xl border border-[color:var(--brand)]/30 bg-[color:var(--brand-soft)] p-4">
+          <p className="eyebrow">Recommendation blend</p>
+          <p className="mt-2 text-[13px] leading-6 text-[var(--ink-secondary)]">
+            {deployment
+              ? `Architect chose ${deployment.architecture}; Cost Optimizer compares configured tools and currently routes best to ${bestTool?.label ?? "—"}.`
+              : "After n8n returns costs, this ranks configured deployment tools. Today ECS and ACA are live; App Runner is visible but intentionally not wired."}
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          {DEPLOYMENT_TOOLS.map((tool) => {
+            const cost = costForTool(tool, costs);
+            const isBest = bestTool?.id === tool.id;
+            const isRecommended = recommended === tool.provider && tool.configured;
+            const isCheapest = cheapest === tool.provider && tool.configured;
+            return (
+              <ToolRouteCard
+                key={tool.id}
+                tool={tool}
+                cost={cost}
+                isBest={isBest}
+                isRecommended={isRecommended}
+                isCheapest={isCheapest}
+              />
+            );
+          })}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function ToolRouteCard({
+  tool,
+  cost,
+  isBest,
+  isRecommended,
+  isCheapest,
+}: {
+  tool: DeploymentTool;
+  cost: number;
+  isBest: boolean;
+  isRecommended: boolean;
+  isCheapest: boolean;
+}) {
+  return (
+    <div
+      className={[
+        "rounded-xl border p-4 transition",
+        isBest
+          ? "border-[color:var(--brand)]/40 bg-[color:var(--brand-soft)]"
+          : tool.configured
+            ? "border-[var(--line-soft)] bg-[var(--bg-raised)]"
+            : "border-[var(--line-soft)] bg-[var(--bg-input)] opacity-75",
+      ].join(" ")}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-display text-sm font-semibold text-[var(--ink-primary)]">
+              {tool.label}
+            </p>
+            {isBest ? <Flag label="best route" tone="brand" /> : null}
+            {isRecommended && !isBest ? <Flag label="architect" tone="brand" /> : null}
+            {isCheapest && !isBest ? <Flag label="cheapest" tone="ok" /> : null}
+            {!tool.configured ? <span className="rounded-full border border-[var(--line-medium)] bg-[var(--bg-input)] px-2 py-0.5 font-display text-[9.5px] uppercase tracking-[0.24em] text-[var(--ink-tertiary)]">not wired</span> : null}
+          </div>
+          <p className="mt-1 text-[12px] text-[var(--ink-tertiary)]">
+            {tool.region} · {tool.description}
+          </p>
+        </div>
+        <p className="numerals shrink-0 text-xl font-semibold text-[var(--ink-primary)]">
+          {tool.configured && cost > 0 ? `$${cost}` : "—"}
+          {tool.configured ? (
+            <span className="ml-0.5 text-[12px] font-normal text-[var(--ink-tertiary)]">
+              /mo
+            </span>
+          ) : null}
+        </p>
+      </div>
     </div>
   );
 }
