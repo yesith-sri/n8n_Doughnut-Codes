@@ -206,10 +206,39 @@ async function ensureResourceGroup(
     if (!/not.?found|ResourceGroupNotFound|ResourceNotFound/i.test(message)) throw err;
   }
 
-  await resources.resourceGroups.createOrUpdate(resourceGroup, {
-    location: region,
-    tags: { managedBy: "forge-mvp" },
-  });
+  try {
+    await resources.resourceGroups.createOrUpdate(resourceGroup, {
+      location: region,
+      tags: { managedBy: "forge-mvp" },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Existing resource groups have an immutable location. Azure can still
+    // create regional resources (like Container Apps) inside the group, so do
+    // not fail just because the RG lives in eastus and the app is southeastasia.
+    if (/resource group already exists in location/i.test(message)) return;
+    throw err;
+  }
+}
+
+async function ensureProviderRegistered(
+  resources: ResourceManagementClient,
+  namespace: string,
+) {
+  try {
+    const current = await resources.providers.get(namespace);
+    if (current.registrationState === "Registered") return;
+
+    await resources.providers.register(namespace);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/authorization|forbidden|does not have authorization/i.test(message)) {
+      throw new Error(
+        `Azure subscription is not registered for ${namespace}, and this service principal cannot register it. In Azure Portal, go to Subscription → Resource providers → ${namespace} → Register, then retry. Original error: ${message}`,
+      );
+    }
+    throw err;
+  }
 }
 
 async function ensureManagedEnvironment(
@@ -326,6 +355,7 @@ async function createApp(payload: ProvisionPayload) {
   );
 
   try {
+    await ensureProviderRegistered(resources, "Microsoft.App");
     await ensureResourceGroup(resources, cfg.resourceGroup, cfg.region);
     const env = await ensureManagedEnvironment(
       apps,
