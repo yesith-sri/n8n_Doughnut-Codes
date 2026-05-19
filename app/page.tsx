@@ -66,6 +66,22 @@ type DeploymentResponse = {
   resumeUrl: string;
 };
 
+type ProvisionResponse = {
+  ok?: boolean;
+  action?: string;
+  ready?: boolean;
+  status?: string;
+  error?: string;
+  blocker?: string;
+  fix?: string;
+  clusterName?: string;
+  serviceName?: string;
+  serviceUrl?: string;
+  healthCheckPath?: string;
+  port?: number | string;
+  region?: string;
+};
+
 type LogLevel = "info" | "success" | "warning" | "error";
 
 type LogEntry = {
@@ -348,6 +364,7 @@ export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [deployment, setDeployment] = useState<DeploymentResponse | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null);
+  const [deploymentUrl, setDeploymentUrl] = useState<string | null>(null);
   // Seed log uses a stable id + empty timestamp so server and client render
   // identical HTML — no hydration mismatch.
   const [logs, setLogs] = useState<LogEntry[]>(() => [
@@ -448,6 +465,7 @@ export default function Home() {
     setStatus("submitting");
     setSelectedProvider(null);
     setDeployment(null);
+    setDeploymentUrl(null);
     setMessages([]);
     setCurrentResumeUrl(null);
     pushLog(makeLog("Frontend", "info", `Submitting ${dockerImage} to n8n.`));
@@ -702,24 +720,25 @@ export default function Home() {
       return;
     }
 
-    if (data.status === "deploying") {
+    if (data.status === "deploying" || (action === "approve" && res.ok)) {
       setStatus("deploying");
       setMessages((prev) => [
         ...prev,
         makeMessage(
           "assistant",
           "Workflow",
-          `Acknowledged. Deploy Agent is generating the ${chosen.toUpperCase()} configuration now. Watch the n8n execution for the deploy outcome — the frontend will reflect the next status once a /status endpoint is wired.`,
+          `Acknowledged. n8n recorded the approval. Forge is now calling the ${chosen.toUpperCase()} provisioner and will verify the public endpoint here.`,
         ),
       ]);
       pushLog(
         makeLog(
           "Workflow",
           "info",
-          `Resume webhook acknowledged. ${chosen.toUpperCase()} branch is live.`,
+          `Resume webhook acknowledged. Starting ${chosen.toUpperCase()} provisioning from Forge.`,
         ),
       );
-    } else if (data.status === "rejected") {
+      await provisionApprovedDeployment(chosen);
+    } else if (data.status === "rejected" || (action === "reject" && res.ok)) {
       setStatus("rejected");
       setMessages((prev) => [
         ...prev,
@@ -741,6 +760,153 @@ export default function Home() {
     // Resume URL is spent after a final.
     setCurrentResumeUrl(null);
     setIsChatting(false);
+  }
+
+  async function provisionApprovedDeployment(provider: Provider) {
+    if (!deployment) {
+      surfaceChatError("Cannot provision: missing deployment record from n8n.");
+      setStatus("failed");
+      return;
+    }
+
+    if (provider === "gcp") {
+      surfaceChatError("GCP deploy is not wired yet. Choose AWS ECS or Azure Container Apps.");
+      setStatus("failed");
+      return;
+    }
+
+    const endpoint =
+      provider === "azure" ? "/api/azure/provision" : "/api/aws/provision";
+    const port = Number(String(deployment.ports || "80").split(",")[0].trim() || 80);
+    const payload = {
+      action: "create",
+      deploymentId: Number(deployment.deploymentId) || undefined,
+      projectName: `forge-${deployment.deploymentId}`,
+      image: deployment.dockerImageUrl,
+      port,
+      memoryMB: deployment.memoryMB,
+      cpuLimit: deployment.cpuCores,
+      healthCheckPath: "/",
+    };
+
+    pushLog(
+      makeLog(
+        "Provisioner",
+        "info",
+        `Calling ${endpoint} for ${deployment.dockerImageUrl} on port ${port}.`,
+      ),
+    );
+
+    try {
+      const created = await callProvisioner(endpoint, payload);
+      const ready = created.serviceUrl
+        ? created
+        : await pollProvisioner(endpoint, created, port);
+
+      if (!ready.serviceUrl) {
+        throw new Error(
+          ready.error ??
+            `Provisioner finished without a service URL. Status: ${ready.status ?? "unknown"}`,
+        );
+      }
+
+      const health = await checkDeploymentHealth(
+        ready.serviceUrl,
+        ready.healthCheckPath || "/",
+      );
+      if (!health.ok) {
+        throw new Error(
+          `Deployment URL was created but health returned HTTP ${health.status}.`,
+        );
+      }
+
+      setDeploymentUrl(ready.serviceUrl);
+      setStatus("deployed");
+      setMessages((prev) => [
+        ...prev,
+        makeMessage(
+          "assistant",
+          "Provisioner",
+          `Deployment succeeded on ${provider.toUpperCase()}: ${ready.serviceUrl}`,
+        ),
+      ]);
+      pushLog(
+        makeLog(
+          "Provisioner",
+          "success",
+          `Deployment healthy at ${ready.serviceUrl}.`,
+        ),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setStatus("failed");
+      setError(msg);
+      setMessages((prev) => [
+        ...prev,
+        makeMessage("assistant", "Provisioner", `Deployment failed: ${msg}`),
+      ]);
+      pushLog(makeLog("Provisioner", "error", msg));
+    }
+  }
+
+  async function callProvisioner(
+    endpoint: string,
+    payload: Record<string, unknown>,
+  ): Promise<ProvisionResponse> {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const raw = await res.text();
+    let data: ProvisionResponse;
+    try {
+      data = JSON.parse(raw) as ProvisionResponse;
+    } catch {
+      throw new Error(`Provisioner returned non-JSON: ${raw.slice(0, 240)}`);
+    }
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.error ?? data.blocker ?? `Provisioner failed (${res.status}).`);
+    }
+    return data;
+  }
+
+  async function pollProvisioner(
+    endpoint: string,
+    created: ProvisionResponse,
+    port: number,
+  ): Promise<ProvisionResponse> {
+    if (!created.clusterName || !created.serviceName) return created;
+
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 15_000));
+      pushLog(
+        makeLog(
+          "Provisioner",
+          "info",
+          `Waiting for public endpoint (${attempt}/10).`,
+        ),
+      );
+      const statusResult = await callProvisioner(endpoint, {
+        action: "status",
+        clusterName: created.clusterName,
+        serviceName: created.serviceName,
+        port,
+        healthCheckPath: created.healthCheckPath || "/",
+      });
+      if (statusResult.serviceUrl) return statusResult;
+    }
+
+    return created;
+  }
+
+  async function checkDeploymentHealth(serviceUrl: string, path: string) {
+    const res = await fetch("/api/health", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: new URL(path, serviceUrl).toString() }),
+    });
+    return (await res.json()) as { ok: boolean; status: number };
   }
 
   // ------------------------------------------------------------------
@@ -1108,6 +1274,19 @@ export default function Home() {
                   hint={deployment ? "live response captured" : "no submit yet"}
                 />
               </div>
+              {deploymentUrl ? (
+                <div className="mt-4 panel-raised p-4">
+                  <p className="eyebrow">Deployment URL</p>
+                  <a
+                    href={deploymentUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-2 block break-all font-mono text-[12px] text-[var(--status-ok)] underline decoration-[color:var(--status-ok)]/40 underline-offset-4"
+                  >
+                    {deploymentUrl}
+                  </a>
+                </div>
+              ) : null}
               <div className="mt-4 grid gap-3 md:grid-cols-3">
                 <MetricChip
                   label="Architecture"
