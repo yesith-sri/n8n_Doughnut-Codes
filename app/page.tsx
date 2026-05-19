@@ -1714,7 +1714,7 @@ function AgentDashboard({
           <AgentCard
             key={agent.name}
             name={agent.name}
-            state={agent.state}
+            state={agent.state as "done" | "active" | "pending" | "failed"}
             output={agent.output}
           />
         ))}
