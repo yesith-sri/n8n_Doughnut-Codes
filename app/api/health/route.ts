@@ -46,11 +46,16 @@ export async function POST(request: Request) {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const timedOut =
+      err instanceof DOMException && err.name === "TimeoutError";
+
     return json(200, {
       ok: false,
       status: 0,
       url: target.toString(),
-      error: message,
+      error: timedOut
+        ? "Health check timed out before the service responded."
+        : message,
     });
   }
 }

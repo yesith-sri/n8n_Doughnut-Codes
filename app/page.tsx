@@ -82,6 +82,13 @@ type ProvisionResponse = {
   region?: string;
 };
 
+type DeploymentHealthResponse = {
+  ok: boolean;
+  status: number;
+  url?: string;
+  error?: string;
+};
+
 type LogLevel = "info" | "success" | "warning" | "error";
 
 type LogEntry = {
@@ -812,13 +819,14 @@ export default function Home() {
         );
       }
 
-      const health = await checkDeploymentHealth(
+      const health = await waitForDeploymentHealth(
         ready.serviceUrl,
         ready.healthCheckPath || "/",
       );
       if (!health.ok) {
+        const detail = health.error ? ` (${health.error})` : "";
         throw new Error(
-          `Deployment URL was created but health returned HTTP ${health.status}.`,
+          `Deployment URL was created but health returned HTTP ${health.status}${detail}.`,
         );
       }
 
@@ -902,13 +910,39 @@ export default function Home() {
     return created;
   }
 
-  async function checkDeploymentHealth(serviceUrl: string, path: string) {
+  async function waitForDeploymentHealth(
+    serviceUrl: string,
+    path: string,
+  ): Promise<DeploymentHealthResponse> {
+    let last: DeploymentHealthResponse = { ok: false, status: 0 };
+
+    for (let attempt = 1; attempt <= 12; attempt += 1) {
+      last = await checkDeploymentHealth(serviceUrl, path);
+      if (last.ok) return last;
+
+      pushLog(
+        makeLog(
+          "Provisioner",
+          "warning",
+          `Health check not ready (${attempt}/12): HTTP ${last.status}${last.error ? ` - ${last.error}` : ""}.`,
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+
+    return last;
+  }
+
+  async function checkDeploymentHealth(
+    serviceUrl: string,
+    path: string,
+  ): Promise<DeploymentHealthResponse> {
     const res = await fetch("/api/health", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: new URL(path, serviceUrl).toString() }),
     });
-    return (await res.json()) as { ok: boolean; status: number };
+    return (await res.json()) as DeploymentHealthResponse;
   }
 
   // ------------------------------------------------------------------
