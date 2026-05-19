@@ -102,6 +102,8 @@ type ChatMessage = {
   ts: string;
 };
 
+type AgentState = Exclude<StageState, "skipped">;
+
 // ---------- Security scan types -------------------------------------------
 
 type ScanSeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
@@ -1652,7 +1654,7 @@ function AgentDashboard({
   currentResumeUrl: string | null;
   bestTool: DeploymentTool | null;
 }) {
-  const agentRows = [
+  const agentRows: Array<{ name: string; state: AgentState; output: string }> = [
     {
       name: "Analyzer Agent",
       state: deployment ? "done" : status === "submitting" ? "active" : "pending",
@@ -1714,7 +1716,7 @@ function AgentDashboard({
           <AgentCard
             key={agent.name}
             name={agent.name}
-            state={agent.state as "done" | "active" | "pending" | "failed"}
+            state={agent.state}
             output={agent.output}
           />
         ))}
@@ -1729,7 +1731,7 @@ function AgentCard({
   output,
 }: {
   name: string;
-  state: "done" | "active" | "pending" | "failed";
+  state: AgentState;
   output: string;
 }) {
   const tone =
